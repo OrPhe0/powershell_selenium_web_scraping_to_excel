@@ -1,0 +1,156 @@
+#### THIS SCRIPT IS FOR ONE SITE ONLY FOR NOW, ADD IN YOUR URL AT LINE 123 ### 
+# This script uses chromedriver, htmlagilitypack and ImportExcel. Install-Module -Name ImportExcel
+# Remember to add in your chromedriver and htmlagilitypack, chromedriver line 6 and htmlagilitypack line 45
+
+# Global Variables
+$webDriverPath = 'C:\project1\chromedriver-win64' # Add your chromedriver
+$excelFilePath = 'C:\project1\data.xlsx' # Add your excelfile. My excelfile has a sheet called input
+
+# Function to Start WebDriver with Minimal Wait
+function Start-WebDriver {
+    param (
+        [string]$WebDriverDirectory,
+        [int]$ImplicitWait = 1  # Minimal wait
+    )
+    Import-Module Selenium
+    $driver = Start-SeChrome -WebDriverDirectory $WebDriverDirectory
+    $driver.Manage().Timeouts().ImplicitWait = [TimeSpan]::FromSeconds($ImplicitWait)
+    return $driver
+}
+
+# Function to Accept Cookie Consent
+function Accept-CookieConsent {
+    param (
+        [OpenQA.Selenium.IWebDriver]$Driver,
+        [string]$IframeId,
+        [string]$AcceptButtonXPath
+    )
+    try {
+        $iframe = $Driver.FindElementById($IframeId)
+        $Driver.SwitchTo().Frame($iframe)
+        $acceptButton = $Driver.FindElementByXPath($AcceptButtonXPath)
+        $acceptButton.Click()
+        $Driver.SwitchTo().DefaultContent()
+        Write-Host "Cookie consent accepted."
+    } catch {
+        Write-Host "Cookie consent not found or already accepted."
+    }
+}
+
+# Function to Extract Text from the Page
+function Extract-PageText {
+    param (
+        [OpenQA.Selenium.IWebDriver]$Driver
+    )
+    Add-Type -Path 'C:\Program Files\WindowsPowerShell\Modules\HtmlAgilityPack\lib\Net45\HtmlAgilityPack.dll' ## Add your HtmlAgilityPack.dll file here
+    $htmlContent = $Driver.PageSource
+    $htmlDoc = New-Object HtmlAgilityPack.HtmlDocument
+    $htmlDoc.LoadHtml($htmlContent)
+    $textNodes = $htmlDoc.DocumentNode.SelectNodes('//p | //li')
+    
+    $textList = @()
+    if ($textNodes -ne $null) {
+        foreach ($node in $textNodes) {
+            $text = $node.InnerText.Trim()
+            if (![string]::IsNullOrWhiteSpace($text)) {
+                $textList += $text
+            }
+        }
+    } else {
+        Write-Host "No text nodes found."
+    }
+    return $textList
+}
+
+# Function to Check if a URL Has Already Been Scraped
+function Is-UrlAlreadyScraped {
+    param (
+        [string]$ExcelFilePath,
+        [string]$Url
+    )
+    if (-not (Test-Path $ExcelFilePath)) {
+        return $false
+    }
+    $existingData = Import-Excel -Path $ExcelFilePath -WorksheetName 'input'
+    return $existingData | Where-Object { $_.articleURL -eq $Url }
+}
+
+# Function to Save Text to an Excel Sheet with Retry Mechanism
+function Save-TextToExcel {
+    param (
+        [string]$ArticleID,
+        [string]$Url,
+        [string[]]$TextList,
+        [string]$ExcelFilePath,
+        [int]$maxRetries = 10
+    )
+    $newRow = @{
+        ArticleID   = $ArticleID
+        articleURL  = $Url
+        ArticleText = [string]::Join("`n", $TextList)
+    }
+
+    $retryCount = 0
+    $success = $false
+
+    while (-not $success -and $retryCount -lt $maxRetries) {
+        try {
+            $newRow | Export-Excel -Path $ExcelFilePath -WorksheetName 'input' -Append
+            Write-Host "Data successfully appended to the Excel file."
+            $success = $true
+        } catch {
+            Write-Host "Excel file is in use, retrying... Attempt $($retryCount + 1) of $maxRetries"
+            Start-Sleep -Seconds 1
+            $retryCount++
+        }
+    }
+
+    if (-not $success) {
+        Write-Host "Failed to append data after $maxRetries attempts. Please close the Excel file and try again."
+    }
+}
+
+# Main Script Logic
+function Scrape-Articles {
+    param (
+        [string]$WebDriverPath,
+        [string]$ExcelFilePath
+    )
+
+    $driver = Start-WebDriver -WebDriverDirectory $WebDriverPath
+
+    try {
+        $driver.Navigate().GoToUrl('https://www.google.com') #IMPORTANT ADD YOUR URL HERE
+        Accept-CookieConsent -Driver $driver -IframeId 'sp_message_iframe_1147405' -AcceptButtonXPath "//button[@title='Godta alle']"
+
+        # Extract article URLs
+        $articleLinks = $driver.FindElementsByXPath("//a[contains(@href, '/somethinghere/')]") # Change to what fits your site if you need to scrape something that is https://google.com/somethinghere/
+        $articleUrls = $articleLinks | ForEach-Object { ($_.GetAttribute("href") -split '\?')[0] }
+
+        # Process each article URL
+        foreach ($targetUrl in $articleUrls) {
+            Write-Host "Processing URL: $targetUrl"
+
+            if (Is-UrlAlreadyScraped -ExcelFilePath $ExcelFilePath -Url $targetUrl) {
+                Write-Host "URL already scraped. Skipping..."
+                continue
+            }
+
+            $driver.Navigate().GoToUrl($targetUrl)
+            Start-Sleep -Milliseconds 1500  # Allow page to load
+
+            $pageText = Extract-PageText -Driver $driver
+            $articleID = (Import-Excel -Path $ExcelFilePath -WorksheetName 'input' | Measure-Object).Count
+            Save-TextToExcel -ArticleID ($articleID + 1) -Url $targetUrl -TextList $pageText -ExcelFilePath $ExcelFilePath
+        }
+
+    } finally {
+        if ($driver -ne $null) {
+            Write-Host "Scraping complete. Quitting WebDriver."
+            $driver.Quit()
+        }
+    }
+}
+
+# Execution
+Scrape-Articles -WebDriverPath $webDriverPath -ExcelFilePath $excelFilePath
